@@ -1,0 +1,36 @@
+# Common Ruby/Gems
+.bundle/
+vendor/bundle/
+*.gem
+.yardoc/
+_yardoc/
+doc/
+rdoc/
+pkg/
+spec/reports/
+coverage/
+.rspec_status
+spec/examples.txt
+
+# Rails specifics (for fixtures)
+fixtures/rails_app/storage/*.sqlite3
+fixtures/rails_app/log/*.log
+fixtures/rails_app/tmp/
+fixtures/rails_app/node_modules/
+fixtures/rails_app/public/assets
+fixtures/rails_app/spec/examples.txt
+
+# Project specific temporary files
+tmp/
+*.log
+*.sock
+spike_rspec.rb
+repro_*.rb
+debug_*.rb
+
+# IDE/OS junk
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/

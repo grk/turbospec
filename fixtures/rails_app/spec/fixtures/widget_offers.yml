@@ -1,0 +1,4 @@
+# Dummy fixture
+basic_offer:
+  id: 1
+  name: "Basic Offer"
