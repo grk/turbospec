@@ -14,6 +14,17 @@ module Turbospec
       match ? match[1].to_i : nil
     end
 
+    HELLO = "HELLO"
+
+    def self.hello_command(worker_index)
+      "#{HELLO} #{worker_index}"
+    end
+
+    def self.parse_hello_command(line)
+      match = line.match(/^#{HELLO} (\d+)/)
+      match ? match[1].to_i : nil
+    end
+
     def self.result?(line)
       line.start_with?("{")
     end

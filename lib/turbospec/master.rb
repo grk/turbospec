@@ -15,9 +15,12 @@ module Turbospec
       @order = options[:order]
       @profile = options[:profile]
       @shard = options[:shard]
+      @timeout = options[:timeout]
+      @timings = options[:timings]
+      @timings_out = options[:timings_out]
       @socket_path = File.join(Dir.tmpdir, "turbospec_#{Process.pid}.sock")
       @server = UNIXServer.new(@socket_path)
-      @worker_pids = []
+      @worker_pids = {}
       @failed = false
     end
 
@@ -79,6 +82,8 @@ module Turbospec
             persister = RSpec::Core::ExampleStatusPersister.new(@examples, RSpec.configuration.example_status_persistence_file_path)
             persister.persist
           end
+
+          write_timings_out if @timings_out
         end
         shutdown
       end
@@ -102,7 +107,7 @@ module Turbospec
     end
 
     def kill_workers(signal)
-      @worker_pids.each do |pid|
+      @worker_pids.each_value do |pid|
         Process.kill(signal, pid) rescue nil
       end
     end
@@ -110,57 +115,108 @@ module Turbospec
     def spawn_workers
       Turbospec.configuration.before_fork_hook&.call
 
-      @workers.times do |i|
-        pid = fork do
-          # Child process
-          require_relative "worker"
-          Worker.new(@socket_path, i).run
-        end
-        @worker_pids << pid
+      @workers.times { |i| spawn_worker(i) }
+    end
+
+    def spawn_worker(index)
+      pid = fork do
+        # Child process
+        require_relative "worker"
+        Worker.new(@socket_path, index).run
       end
+      @worker_pids[index] = pid
     end
 
     def run_loop
-      active_workers = @workers
-      sockets = [@server]
-      worker_to_example = {}
+      @active_workers = @workers
+      @sockets = [@server]
+      @inflight = {}      # socket => { example_index:, since: }
+      @socket_worker = {} # socket => worker index
 
-      while active_workers > 0
-        ready, = IO.select(sockets)
+      while @active_workers > 0
+        ready, = IO.select(@sockets, nil, nil, @timeout && 1)
 
-        ready.each do |s|
+        (ready || []).each do |s|
           if s == @server
-            sockets << @server.accept
+            @sockets << @server.accept
           else
             line = s.gets&.strip
             case line
+            when /\A#{Protocol::HELLO}/o
+              @socket_worker[s] = Protocol.parse_hello_command(line)
             when Protocol::READY
               if @queue.empty? || (@fail_fast && @failed)
                 s.puts Protocol::NONE
               else
                 index = @queue.shift
-                worker_to_example[s] = index
+                @inflight[s] = { example_index: index, since: Time.now }
                 s.puts Protocol.work_command(index)
               end
             when /^\{/
-              worker_to_example.delete(s)
+              @inflight.delete(s)
               handle_result(line)
               if @fail_fast && @failed
                 @queue.clear
               end
             when Protocol::DONE
-              active_workers -= 1
-              sockets.delete(s)
-              s.close
+              drop_worker(s)
             when nil
               # Socket closed or error unexpectedly
-              handle_worker_crash(worker_to_example.delete(s)) if worker_to_example[s]
-              active_workers -= 1
-              sockets.delete(s)
-              s.close
+              if (work = @inflight.delete(s))
+                handle_worker_crash(work[:example_index])
+              end
+              drop_worker(s)
             end
           end
         end
+
+        check_timeouts if @timeout
+      end
+    end
+
+    def drop_worker(socket)
+      @active_workers -= 1
+      @socket_worker.delete(socket)
+      @sockets.delete(socket)
+      socket.close
+    end
+
+    def check_timeouts
+      now = Time.now
+      @inflight.select { |_s, work| now - work[:since] > @timeout }.keys.each do |socket|
+        handle_worker_timeout(socket)
+      end
+    end
+
+    def handle_worker_timeout(socket)
+      work = @inflight.delete(socket)
+      worker_index = @socket_worker[socket]
+      example = @examples[work[:example_index]]
+
+      warn "turbospec: example exceeded the #{@timeout}s timeout, killing worker #{worker_index}: #{example.id}"
+
+      # A result that arrived exactly at the deadline may still be buffered on
+      # the socket; we drop it and conservatively report a timeout failure.
+      if (pid = @worker_pids[worker_index])
+        Process.kill("KILL", pid) rescue nil
+        Process.waitpid(pid) rescue nil
+      end
+      drop_worker(socket)
+
+      @reporter.example_started(example)
+      res = example.execution_result
+      res.status = :failed
+      res.exception = RuntimeError.new(
+        "Example exceeded the #{@timeout}s timeout (--timeout) and its worker was killed"
+      )
+      @failed = true
+      @reporter.example_failed(example)
+
+      if @fail_fast
+        @queue.clear
+      elsif !@queue.empty?
+        spawn_worker(worker_index)
+        @active_workers += 1
       end
     end
 
@@ -216,6 +272,16 @@ module Turbospec
       shard_index = @shard[:index]
       shard_total = @shard[:total]
 
+      if @shard[:mode] == :hash
+        require 'zlib'
+        # CRC32, NOT String#hash: #hash is SipHash-seeded per process, so
+        # every machine would compute a different partition — overlapping on
+        # some examples and silently dropping others.
+        @queue.select! { |index| Zlib.crc32(@examples[index].id) % shard_total == shard_index }
+        puts "Shard #{shard_index + 1}/#{shard_total} (hash): #{@queue.size} examples"
+        return
+      end
+
       # Load timing data for smart balancing
       timings = load_timing_data
 
@@ -256,10 +322,23 @@ module Turbospec
 
     def load_timing_data
       timings = {}
-      persistence_file = RSpec.configuration.example_status_persistence_file_path
-      return timings unless persistence_file && File.exist?(persistence_file)
 
-      File.readlines(persistence_file).each do |line|
+      if @timings
+        # Sorted glob order makes the merge deterministic: when an example
+        # appears in several files (it moved shards between runs), the
+        # lexicographically last file wins.
+        Dir.glob(@timings).sort.each { |path| parse_timing_file(path, timings) }
+      else
+        parse_timing_file(RSpec.configuration.example_status_persistence_file_path, timings)
+      end
+
+      timings
+    end
+
+    def parse_timing_file(path, timings)
+      return unless path && File.exist?(path)
+
+      File.readlines(path).each do |line|
         # Skip header lines
         next if line.start_with?('example_id', '-')
 
@@ -270,8 +349,22 @@ module Turbospec
           timings[example_id] = runtime
         end
       end
+    end
 
-      timings
+    def write_timings_out
+      require 'fileutils'
+      FileUtils.mkdir_p(File.dirname(@timings_out))
+
+      File.open(@timings_out, 'w') do |f|
+        @reporter.examples.each do |example|
+          result = example.execution_result
+          next unless result.run_time
+
+          # %.5f, not round: tiny floats round to scientific notation
+          # ("4.0e-05"), which the parser doesn't accept.
+          f.puts "#{example.id} | #{result.status} | #{format('%.5f', result.run_time)} seconds |"
+        end
+      end
     end
 
     def print_profile

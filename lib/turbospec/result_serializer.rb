@@ -86,7 +86,15 @@ module Turbospec
       if cause
         ex = ExceptionWithCause.new(klass, ex_data["message"], ex_data["backtrace"], cause)
       else
-        ex = klass.new(ex_data["message"])
+        ex =
+          begin
+            klass.new(ex_data["message"])
+          rescue StandardError
+            # Custom constructors (e.g. required keyword arguments) can't be
+            # rebuilt from a message string; fall back to the wrapper, which
+            # fakes the original class for display.
+            ExceptionWithCause.new(klass, ex_data["message"], ex_data["backtrace"], nil)
+          end
         ex.set_backtrace(ex_data["backtrace"])
       end
 

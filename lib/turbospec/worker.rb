@@ -12,6 +12,10 @@ module Turbospec
       # Connect to master
       socket = UNIXSocket.new(@socket_path)
 
+      # Identify before the (potentially slow) setup so the master can map
+      # this socket to our pid for the hung-example watchdog.
+      socket.puts Protocol.hello_command(@index)
+
       require_relative "worker_reporter"
 
       setup_worker

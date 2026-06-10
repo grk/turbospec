@@ -9,7 +9,7 @@ module Turbospec
       $LOAD_PATH.unshift(File.join(Dir.pwd, "spec")) if File.directory?("spec") && !$LOAD_PATH.include?(File.join(Dir.pwd, "spec"))
       $LOAD_PATH.unshift(File.join(Dir.pwd, "lib")) if File.directory?("lib") && !$LOAD_PATH.include?(File.join(Dir.pwd, "lib"))
 
-      options = { workers: Etc.nprocessors, fail_fast: false, only_failures: false, order: nil, profile: nil, shard: nil }
+      options = { workers: Etc.nprocessors, fail_fast: false, only_failures: false, order: nil, profile: nil, shard: nil, timeout: 120 }
 
       # Manual parsing to preserve order of remaining arguments for RSpec.
       # OptionParser's rescue-retry loop can scramble flags and their values.
@@ -39,17 +39,35 @@ module Turbospec
           options[:profile] = $1.to_i
         when /\A--profile\z/
           options[:profile] = 10  # Default to top 10
-        when /\A--shard=(\d+)\/(\d+)\z/
+        when /\A--shard=(?:(hash):)?(\d+)\/(\d+)\z/
           # Convert 1-based input to 0-based internal index
-          options[:shard] = { index: $1.to_i - 1, total: $2.to_i }
+          options[:shard] = { mode: $1 ? :hash : :timing, index: $2.to_i - 1, total: $3.to_i }
+        when "--timeout"
+          i += 1
+          options[:timeout] = parse_timeout(argv[i])
+        when /\A--timeout=(.*)\z/
+          options[:timeout] = parse_timeout($1)
+        when "--timings"
+          i += 1
+          options[:timings] = argv[i]
+        when /\A--timings=(.*)\z/
+          options[:timings] = $1
+        when "--timings-out"
+          i += 1
+          options[:timings_out] = argv[i]
+        when /\A--timings-out=(.*)\z/
+          options[:timings_out] = $1
         when "-h", "--help"
-          puts "Usage: prspec [options] [rspec-options]"
+          puts "Usage: turbospec [options] [rspec-options]"
           puts "    -w, --workers COUNT              Number of workers"
           puts "        --fail-fast                  Stop suite on first failure"
           puts "        --only-failures              Run only previously failed examples"
           puts "        --order ORDER                Example ordering: random (default) or runtime"
           puts "    -p, --profile [COUNT]            Show slowest examples (default: 10)"
           puts "        --shard=INDEX/TOTAL          Run shard INDEX of TOTAL (e.g., --shard=1/3)"
+          puts "        --timeout SECONDS            Kill workers whose example runs longer (default: 120, 0 disables)"
+          puts "        --timings GLOB               Read example timings from these files (merged, later files win)"
+          puts "        --timings-out PATH           Write timings of the examples this run executed"
           puts "    -h, --help                       Prints this help"
           exit
         else
@@ -62,6 +80,13 @@ module Turbospec
       require_relative "runner"
       success = Master.new(options, rspec_args).run
       exit(success ? 0 : 1)
+    end
+
+    private
+
+    def parse_timeout(value)
+      seconds = value.to_f
+      seconds.positive? ? seconds : nil
     end
   end
 end

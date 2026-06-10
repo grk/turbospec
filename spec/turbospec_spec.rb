@@ -1,5 +1,6 @@
 require 'spec_helper'
 require 'open3'
+require 'tmpdir'
 
 RSpec.describe "Turbospec Integration" do
   let(:turbospec) { File.expand_path('../exe/turbospec', __dir__) }
@@ -255,6 +256,65 @@ RSpec.describe "Turbospec Integration" do
     expect(count1 + count2).to eq(2)
   end
 
+  it "partitions disjointly and deterministically with --shard=hash:" do
+    stdout1, _, status1 = run_turbospec("-w 1 --shard=hash:1/2 -f doc spec/test_fixtures/hash_sharding.rb")
+    stdout2, _, status2 = run_turbospec("-w 1 --shard=hash:2/2 -f doc spec/test_fixtures/hash_sharding.rb")
+    rerun1, _, _ = run_turbospec("-w 1 --shard=hash:1/2 -f doc spec/test_fixtures/hash_sharding.rb")
+
+    expect(status1.exitstatus).to eq(0)
+    expect(status2.exitstatus).to eq(0)
+    expect(stdout1).to match(/Shard 1\/2 \(hash\): \d+ examples?/)
+
+    examples1 = stdout1.scan(/hs example \d+/).uniq.sort
+    examples2 = stdout2.scan(/hs example \d+/).uniq.sort
+
+    # Disjoint, complete, and stable across runs — correctness must not
+    # depend on timing data or run order.
+    expect(examples1 & examples2).to be_empty
+    expect((examples1 + examples2).size).to eq(20)
+    expect(rerun1.scan(/hs example \d+/).uniq.sort).to eq(examples1)
+  end
+
+  it "writes only ran examples to --timings-out" do
+    Dir.mktmpdir do |dir|
+      out = File.join(dir, "runtimes-1.txt")
+      stdout, _, status = run_turbospec("-w 1 --shard=hash:1/2 --timings-out #{out} spec/test_fixtures/hash_sharding.rb")
+
+      expect(status.exitstatus).to eq(0)
+      shard_count = stdout.match(/Shard 1\/2 \(hash\): (\d+) examples?/)[1].to_i
+      lines = File.readlines(out)
+      expect(lines.size).to eq(shard_count)
+      expect(lines.size).to be < 20 # ran-only: the other shard's examples are absent
+      expect(lines).to all(match(/\A\.\/spec\/test_fixtures\/hash_sharding\.rb\[1:\d+\] \| passed \| [\d.]+ seconds \|$/))
+    end
+  end
+
+  it "merges multiple --timings files with later files winning" do
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "runtimes-1.txt"), <<~TIMINGS)
+        ./spec/test_fixtures/timing_order.rb[1:1] | passed | 1.0 seconds |
+        ./spec/test_fixtures/timing_order.rb[1:2] | passed | 2.0 seconds |
+      TIMINGS
+      File.write(File.join(dir, "runtimes-2.txt"), <<~TIMINGS)
+        ./spec/test_fixtures/timing_order.rb[1:2] | passed | 0.5 seconds |
+      TIMINGS
+
+      stdout, _, status =
+        run_turbospec("-w 1 --order runtime --timings '#{dir}/runtimes-*.txt' -f doc spec/test_fixtures/timing_order.rb")
+
+      expect(status.exitstatus).to eq(0)
+      one = stdout.index("timing example one")
+      two = stdout.index("timing example two")
+      three = stdout.index("timing example three")
+
+      # one (1.0s) runs before two (2.0s overridden to 0.5s by the later
+      # file) which runs before three (untimed). Without last-wins merging,
+      # two would run first.
+      expect(one).to be < two
+      expect(two).to be < three
+    end
+  end
+
   it "handles multiple errors (test failure + after hook failure)" do
     stdout, stderr, status = run_turbospec("-w 1 spec/test_fixtures/multiple_errors.rb")
     expect(status.exitstatus).to eq(1)
@@ -273,6 +333,26 @@ RSpec.describe "Turbospec Integration" do
     expect(stdout).to include("REQUIRE_HELPER: before_fork executed")
     # after_fork runs in each worker
     expect(stdout).to include("REQUIRE_HELPER: after_fork executed for worker 0")
+  end
+
+  it "kills hung examples after --timeout, reports them failed, and respawns the worker" do
+    # -w 1 makes respawning load-bearing: without it the run would end with
+    # zero workers and unran examples still in the queue.
+    stdout, stderr, status = run_turbospec("-w 1 --timeout 2 spec/test_fixtures/hanging_example.rb")
+    expect(status.exitstatus).to eq(1)
+    expect(stdout).to include("6 examples, 1 failure")
+    expect(stdout).to include("timeout")
+    expect(stderr).to include("killing worker")
+  end
+
+  it "reports exceptions whose constructors require keyword arguments" do
+    stdout, stderr, status = run_turbospec("-w 1 spec/test_fixtures/kwarg_exception.rb")
+    expect(status.exitstatus).to eq(1)
+    # Master must survive rehydrating an exception it can't construct directly
+    expect(stderr).not_to include("wrong number of arguments")
+    expect(stdout).to include("2 examples, 1 failure")
+    expect(stdout).to include("KwargError")
+    expect(stdout).to include("kwarg failure message")
   end
 
   it "preserves exception cause chain in failure output" do

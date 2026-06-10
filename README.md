@@ -48,7 +48,10 @@ bundle exec turbospec spec/models --format documentation
 | `--only-failures` | Run only previously failed examples (requires `example_status_persistence_file_path` in RSpec config) |
 | `--order ORDER` | Example ordering: `random` (default) or `runtime` (slowest first, for optimal parallelization) |
 | `-p, --profile [COUNT]` | Show the slowest examples (default: 10) |
-| `--shard=INDEX/TOTAL` | Run a specific shard of examples (1-based, e.g., `--shard=1/3` for first of 3 shards) |
+| `--shard=[hash:]INDEX/TOTAL` | Run a specific shard of examples (1-based, e.g., `--shard=1/3`). Default mode balances using persisted timing data; `hash:` partitions by CRC32 of example id — slightly less balanced but deterministic across machines with no shared state, so shards can never overlap or drop examples |
+| `--timeout SECONDS` | Kill a worker whose example runs longer than this, report the example as failed, and respawn the worker (default: 120, `0` disables) |
+| `--timings GLOB` | Read example timings from these files for `--order runtime` and timing-based sharding (merged in sorted filename order, later files win) |
+| `--timings-out PATH` | Write the timings of the examples this run executed — useful per CI shard, then feed all shards' files back via `--timings` |
 
 All other options are passed through to RSpec.
 

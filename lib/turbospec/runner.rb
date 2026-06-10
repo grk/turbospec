@@ -22,6 +22,8 @@ module Turbospec
 
       # Validate that no before/after(:all) hooks are used.
       # We check the hooks repository directly since RSpec doesn't provide a public API for this.
+      groups_with_context_hooks = []
+
       RSpec.world.ordered_example_groups.each do |group|
         group.descendants.each do |descendant|
           hooks = descendant.hooks
@@ -32,11 +34,22 @@ module Turbospec
                               (after_context && after_context.items_and_filters.any?)
 
           if has_context_hooks
-            raise "turbospec does not support before/after(:all) or before/after(:context) hooks.\n" \
-                  "Use before(:each)/after(:each) for per-example setup, or " \
-                  "before(:suite)/after(:suite) for one-time setup.\n" \
-                  "Found in #{descendant.description} at #{descendant.metadata[:file_path]}"
+            groups_with_context_hooks << "#{descendant.description} at #{descendant.metadata[:file_path]}"
           end
+        end
+      end
+
+      if groups_with_context_hooks.any?
+        if Turbospec.configuration.allow_context_hooks
+          warn "turbospec: #{groups_with_context_hooks.size} group(s) define before/after(:context) hooks; " \
+               "they will run once per example instead of once per group."
+        else
+          raise "turbospec does not support before/after(:all) or before/after(:context) hooks.\n" \
+                "Use before(:each)/after(:each) for per-example setup, or " \
+                "before(:suite)/after(:suite) for one-time setup.\n" \
+                "Set `config.allow_context_hooks = true` to run them once per example instead " \
+                "(safe only for idempotent hooks).\n" \
+                "Found in:\n  #{groups_with_context_hooks.first(10).join("\n  ")}"
         end
       end
 
@@ -48,9 +61,6 @@ module Turbospec
       # This avoids rebuilding it on every run_example call.
       @base_filtered = {}
       RSpec.world.all_example_groups.each { |g| @base_filtered[g] = [] }
-
-      # Cache original filtered state for restoration after each example run.
-      @original_filtered = RSpec.world.filtered_examples.dup
 
       # Precompute root groups for each example to avoid repeated lookups.
       @root_groups = @examples.map do |ex|
@@ -81,16 +91,20 @@ module Turbospec
       # in the root_group hierarchy will also run, causing an explosion
       # of test execution (N^2 behavior).
 
-      begin
-        # Use precomputed base_filtered (shallow dup is safe since we
-        # overwrite the one entry we care about).
-        new_filtered = @base_filtered.dup
-        new_filtered[group] = [example]
+      # Install the all-empty filter once per worker process; afterwards each
+      # example only touches its own group's entry. Copying the full hash
+      # (one entry per group in the whole suite) per example is too slow.
+      filtered = RSpec.world.filtered_examples
+      unless @base_filter_installed
+        filtered.replace(@base_filtered)
+        @base_filter_installed = true
+      end
 
-        RSpec.world.filtered_examples.replace(new_filtered)
+      begin
+        filtered[group] = [example]
         @root_groups[index].run(reporter)
       ensure
-        RSpec.world.filtered_examples.replace(@original_filtered)
+        filtered[group] = []
       end
     end
   end
